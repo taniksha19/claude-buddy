@@ -1,367 +1,713 @@
-"""Claude Buddy: a puppy that peeks out from a screen edge and waves when Claude needs you.
+"""Claude Buddy: a little creature that peeks out from a screen edge when Claude Code needs you.
 
-Left-click: dismiss (it ducks back).  Right-click: menu (side / mute / test / quit).
+Click it to jump to that session, or Allow / Deny a permission request right in its bubble.
+Hover it for today's stats. Right-click it (or the tray icon) for characters, sounds and quiet modes.
+
+    pythonw buddy.pyw          start (only one copy runs)
+    python buddy.pyw --quit    stop the running copy
 """
-import ctypes
 import glob
 import json
-import math
 import os
 import random
+import sys
 import time
 import tkinter as tk
-import winsound
-from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import sysutil  # noqa: E402
+
+try:
+    from PIL import Image, ImageTk
+    import render
+except ImportError:
+    from tkinter import messagebox
+    tk.Tk().withdraw()
+    messagebox.showerror("Claude Buddy", "Claude Buddy needs Pillow.\n\nRun:  python -m pip install pillow")
+    sys.exit(1)
+
 SESSIONS = os.path.join(HERE, "sessions")
 PID_FILE = os.path.join(HERE, "widget.pid")
 CONF = os.path.join(HERE, "buddy_conf.json")
-STALE = 6 * 3600
-KEY = "#ff00fe"  # rendered transparent
+STATS = os.path.join(HERE, "stats.json")
+SOUNDS = os.path.join(HERE, "sounds")
+ICON = os.path.join(HERE, "assets", "buddy.ico")
+
+DEFAULTS = {"char": "golden", "side": "random", "sound": "voice", "approve": True, "approve_wait": 60,
+            "say_hi": True, "quiet_hours": False, "dnd_until": 0}
+VOICE = {"golden": "woof!", "corgi": "boof!", "husky": "awoo!", "cat": "meow!", "frog": "ribbit!"}
 EDGES = ("bottom", "left", "right", "top")
-
-# The puppy is drawn upright in its own coordinates, standing on y=178.
-# Only the window (DX0, DY0)-(DX0+DOGW, DY0+DOGH) of it peeks past the screen edge.
-DX0, DY0, DOGW, DOGH = 45, 40, 160, 102
-BUBW, BUBH = 240, 58
-
-COLORS = {"done": "#ff8fab", "ask": "#ff4d6d"}  # collar / bubble / hearts
-DOG, DOG_EDGE = "#f6d9a8", "#b8865a"
-EAR, EAR_EDGE = "#a86b3c", "#7d4c28"
-PATCH, MUZZLE = "#e9b97f", "#fff3e0"
-INK, BLUSH, TONGUE = "#4a3040", "#ffa3b5", "#ff7f9a"
-FONT = ("Segoe UI Semibold", -12)
+STALE = 6 * 3600
+SLEEPY_AFTER, REMIND_AFTER = 120, 300
+STARTUP_GRACE = 600  # alerts older than this when the buddy starts are skipped
+HI_EVERY = (25 * 60, 45 * 60)
+QUIET = (22, 8)  # quiet hours: 10pm to 8am
+TEST = "__test__"
 
 
-def work_area():
-    r = wintypes.RECT()
-    ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)  # SPI_GETWORKAREA
-    return r.left, r.top, r.right, r.bottom
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
 
 
-class Pen:
-    """Draws on the canvas through a rotation, so the puppy can peek from any edge."""
+def save(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
 
-    def __init__(self, c, fn, dang):
-        self.c, self.fn, self.dang = c, fn, dang
 
-    def _pts(self, coords):
-        out = []
-        for i in range(0, len(coords), 2):
-            out.extend(self.fn(coords[i], coords[i + 1]))
-        return out
+def fmt_minutes(secs):
+    m = int(secs // 60)
+    if m < 1:
+        return "under a minute"
+    return f"{m} min" if m < 60 else f"{m // 60} h {m % 60} min"
 
-    def _box(self, x1, y1, x2, y2):
-        a, b = self.fn(x1, y1)
-        c, d = self.fn(x2, y2)
-        return min(a, c), min(b, d), max(a, c), max(b, d)
 
-    def oval(self, *box, **kw):
-        self.c.create_oval(*self._box(*box), **kw)
+# --- windows -----------------------------------------------------------------
 
-    def arc(self, *box, start=0, **kw):
-        self.c.create_arc(*self._box(*box), start=start + self.dang, **kw)
+if sysutil.WIN:
+    import ctypes
+    from ctypes import wintypes
 
-    def line(self, *coords, **kw):
-        self.c.create_line(*self._pts(coords), **kw)
+    u32, g32 = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
+    H = ctypes.c_void_p
+    for fn, res, args in [
+        (u32.GetAncestor, H, [H, wintypes.UINT]), (u32.GetDC, H, [H]), (u32.ReleaseDC, ctypes.c_int, [H, H]),
+        (u32.GetWindowLongW, ctypes.c_long, [H, ctypes.c_int]),
+        (u32.SetWindowLongW, ctypes.c_long, [H, ctypes.c_int, ctypes.c_long]),
+        (u32.ShowWindow, wintypes.BOOL, [H, ctypes.c_int]),
+        (u32.SetWindowPos, wintypes.BOOL, [H, H, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]),
+        (u32.UpdateLayeredWindow, wintypes.BOOL, [H, H, ctypes.c_void_p, ctypes.c_void_p, H, ctypes.c_void_p,
+                                                  wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]),
+        (u32.SetForegroundWindow, wintypes.BOOL, [H]),
+        (g32.CreateCompatibleDC, H, [H]), (g32.DeleteDC, wintypes.BOOL, [H]),
+        (g32.CreateDIBSection, H, [H, ctypes.c_void_p, wintypes.UINT, ctypes.POINTER(ctypes.c_void_p), H, wintypes.DWORD]),
+        (g32.SelectObject, H, [H, H]), (g32.DeleteObject, wintypes.BOOL, [H]),
+    ]:
+        fn.restype, fn.argtypes = res, args
 
-    def polygon(self, *coords, **kw):
-        self.c.create_polygon(*self._pts(coords), **kw)
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
+                    ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", ctypes.c_long),
+                    ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
 
-    def text(self, x, y, **kw):
-        self.c.create_text(*self.fn(x, y), **kw)
+    class BLENDFUNCTION(ctypes.Structure):
+        _fields_ = [("BlendOp", ctypes.c_ubyte), ("BlendFlags", ctypes.c_ubyte),
+                    ("SourceConstantAlpha", ctypes.c_ubyte), ("AlphaFormat", ctypes.c_ubyte)]
 
+    class LayeredWindow:
+        """Per-pixel-alpha window: smooth edges, and clicks fall through the transparent parts."""
+
+        def __init__(self, root):
+            self.root = root
+            root.withdraw()  # the layered style only takes if it's set while the window is hidden
+            root.update_idletasks()
+            self.hwnd = u32.GetAncestor(root.winfo_id(), 2)  # GA_ROOT
+            ex = u32.GetWindowLongW(self.hwnd, -20)
+            u32.SetWindowLongW(self.hwnd, -20, ex | 0x80000 | 0x80 | 0x08000000)  # LAYERED|TOOLWINDOW|NOACTIVATE
+            self.size, self.dc, self.bmp, self.bits, self.old = None, None, None, ctypes.c_void_p(), None
+            self.visible = True
+            self.update(Image.new("RGBA", (1, 1)), -10, -10)
+            root.deiconify()
+            self.hide()
+
+        def _surface(self, w, h):
+            if self.size == (w, h):
+                return
+            self._free()
+            screen = u32.GetDC(None)
+            self.dc = g32.CreateCompatibleDC(screen)
+            u32.ReleaseDC(None, screen)
+            bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+            buf = (ctypes.c_byte * (ctypes.sizeof(bmi) + 4))()
+            ctypes.memmove(buf, ctypes.byref(bmi), ctypes.sizeof(bmi))
+            self.bmp = g32.CreateDIBSection(self.dc, buf, 0, ctypes.byref(self.bits), None, 0)
+            self.old = g32.SelectObject(self.dc, self.bmp)
+            self.size = (w, h)
+
+        def _free(self):
+            if self.dc:
+                g32.SelectObject(self.dc, self.old)
+                g32.DeleteObject(self.bmp)
+                g32.DeleteDC(self.dc)
+                self.dc = None
+
+        def update(self, img, x, y):
+            w, h = img.size
+            if self.size != (w, h):
+                self.root.geometry(f"{w}x{h}+{x}+{y}")  # keep Tk's idea of the size in sync for mouse events
+            self._surface(w, h)
+            r, g, b, a = img.convert("RGBa").split()  # premultiplied, as Windows wants
+            data = Image.merge("RGBA", (b, g, r, a)).tobytes()
+            ctypes.memmove(self.bits, data, len(data))
+            pt, sz, src = wintypes.POINT(x, y), wintypes.SIZE(w, h), wintypes.POINT(0, 0)
+            blend = BLENDFUNCTION(0, 0, 255, 1)  # AC_SRC_OVER, use per-pixel alpha
+            screen = u32.GetDC(None)
+            u32.UpdateLayeredWindow(self.hwnd, screen, ctypes.byref(pt), ctypes.byref(sz), self.dc,
+                                    ctypes.byref(src), 0, ctypes.byref(blend), 2)  # ULW_ALPHA
+            u32.ReleaseDC(None, screen)
+            if not self.visible:
+                u32.ShowWindow(self.hwnd, 4)  # SW_SHOWNOACTIVATE
+                u32.SetWindowPos(self.hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10)  # topmost
+                self.visible = True
+
+        def hide(self):
+            if self.visible:
+                u32.ShowWindow(self.hwnd, 0)
+                self.visible = False
+
+        def grab_focus(self):
+            u32.SetForegroundWindow(self.hwnd)
+
+    class Tray:
+        """System tray icon, so the buddy can be reached while it's hidden."""
+        WM_TRAY = 0x8001
+
+        def __init__(self, icon_path, tip):
+            from ctypes import WINFUNCTYPE
+            self.events = []
+            k32, s32 = ctypes.WinDLL("kernel32"), ctypes.WinDLL("shell32")
+            self.s32 = s32
+            LRESULT = ctypes.c_ssize_t
+            WNDPROC = WINFUNCTYPE(LRESULT, H, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+            u32.DefWindowProcW.restype, u32.DefWindowProcW.argtypes = LRESULT, [H, wintypes.UINT, wintypes.WPARAM,
+                                                                                wintypes.LPARAM]
+
+            class WNDCLASSW(ctypes.Structure):
+                _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                            ("cbWndExtra", ctypes.c_int), ("hInstance", H), ("hIcon", H), ("hCursor", H),
+                            ("hbrBackground", H), ("lpszMenuName", wintypes.LPCWSTR),
+                            ("lpszClassName", wintypes.LPCWSTR)]
+
+            class NOTIFYICONDATAW(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", H), ("uID", wintypes.UINT),
+                            ("uFlags", wintypes.UINT), ("uCallbackMessage", wintypes.UINT), ("hIcon", H),
+                            ("szTip", ctypes.c_wchar * 128), ("dwState", wintypes.DWORD),
+                            ("dwStateMask", wintypes.DWORD), ("szInfo", ctypes.c_wchar * 256),
+                            ("uVersion", wintypes.UINT), ("szInfoTitle", ctypes.c_wchar * 64),
+                            ("dwInfoFlags", wintypes.DWORD), ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", H)]
+
+            def proc(hwnd, msg, wp, lp):
+                if msg == self.WM_TRAY:
+                    ev = lp & 0xFFFF
+                    if ev == 0x202:      # WM_LBUTTONUP
+                        self.events.append("left")
+                    elif ev == 0x205:    # WM_RBUTTONUP
+                        self.events.append("right")
+                    return 0
+                return u32.DefWindowProcW(hwnd, msg, wp, lp)
+
+            self._proc = WNDPROC(proc)  # keep a reference, or Windows calls into freed memory
+            k32.GetModuleHandleW.restype = H
+            inst = k32.GetModuleHandleW(None)
+            wc = WNDCLASSW(lpfnWndProc=self._proc, hInstance=inst, lpszClassName="ClaudeBuddyTray")
+            u32.RegisterClassW(ctypes.byref(wc))
+            u32.CreateWindowExW.restype = H
+            u32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, H, H, H, H]
+            self.hwnd = u32.CreateWindowExW(0, "ClaudeBuddyTray", "Claude Buddy", 0, 0, 0, 0, 0, None, None, inst, None)
+            u32.LoadImageW.restype = H
+            u32.LoadImageW.argtypes = [H, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            hicon = u32.LoadImageW(None, icon_path, 1, 0, 0, 0x10 | 0x40)  # IMAGE_ICON, LOADFROMFILE|DEFAULTSIZE
+            self.nid = NOTIFYICONDATAW(cbSize=ctypes.sizeof(NOTIFYICONDATAW), hWnd=self.hwnd, uID=1,
+                                       uFlags=0x1 | 0x2 | 0x4, uCallbackMessage=self.WM_TRAY, hIcon=hicon)
+            self.nid.szTip = tip[:127]
+            s32.Shell_NotifyIconW(0, ctypes.byref(self.nid))  # NIM_ADD
+
+        def set_tip(self, tip):
+            if self.nid.szTip != tip[:127]:
+                self.nid.szTip = tip[:127]
+                self.s32.Shell_NotifyIconW(1, ctypes.byref(self.nid))  # NIM_MODIFY
+
+        def remove(self):
+            self.s32.Shell_NotifyIconW(2, ctypes.byref(self.nid))  # NIM_DELETE
+
+
+class TkWindow:
+    """macOS / Linux fallback: a borderless Tk window showing the frame as an image."""
+
+    def __init__(self, root):
+        self.root = root
+        self.bg = "systemTransparent" if sysutil.MAC else "#202124"
+        if sysutil.MAC:
+            root.attributes("-transparent", True)
+        root.config(bg=self.bg)
+        self.label = tk.Label(root, bg=self.bg, bd=0, highlightthickness=0)
+        self.label.pack()
+        self.photo = None
+        self.visible = False
+        root.withdraw()
+
+    def update(self, img, x, y):
+        if not sysutil.MAC:  # no per-pixel alpha on X11: flatten onto the background
+            flat = Image.new("RGBA", img.size, self.bg)
+            flat.alpha_composite(img)
+            img = flat
+        self.photo = ImageTk.PhotoImage(img)
+        self.label.config(image=self.photo)
+        self.root.geometry(f"{img.width}x{img.height}+{x}+{y}")
+        if not self.visible:
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.visible = True
+
+    def hide(self):
+        if self.visible:
+            self.root.withdraw()
+            self.visible = False
+
+    def grab_focus(self):
+        self.root.focus_force()
+
+
+# --- the buddy ---------------------------------------------------------------
 
 class Buddy:
     def __init__(self):
-        self.conf = self.load_conf()
+        self.conf = dict(DEFAULTS, **load(CONF, {}))
+        self.stats = load(STATS, {})
+        self.k = sysutil.dpi_scale()
+
         self.root = tk.Tk()
+        self.root.title("Claude Buddy")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", KEY)
-        self.root.configure(bg=KEY)
-        self.c = tk.Canvas(self.root, bg=KEY, highlightthickness=0)
-        self.c.pack()
+        self.win = LayeredWindow(self.root) if sysutil.WIN else TkWindow(self.root)
 
-        self.alert = None      # record currently being shown
-        self.seen = {}         # session -> alert_at already handled
-        self.progress = 0.0    # 0 = hidden, 1 = fully peeking out
-        self.target = 0.0
-        self.offset = 0.5
-        self.t0 = time.time()
-        self.layout("bottom")
+        self.sessions = {}       # sid -> record from the hook
+        self.fake = {}           # test alerts
+        self.prev_state = {}     # sid -> state at the last poll
+        self.shown = {}          # sid -> alert_at we already popped up for
+        self.handled = {}        # sid -> alert_at the user dealt with
+        self.reminded = set()
+        self.pending = []
+        self.current = None
+        self.mode = "hidden"     # hidden | alert | hi
+        self.progress, self.target = 0.0, 0.0
+        self.edge, self.anchor, self.area = "bottom", 0.5, (0, 0, 1, 1)
+        self.t0 = self.alert_started = self.started = time.time()
+        self.hover = None
+        self.boxes, self.crop = {}, (0, 0)
+        self.hi_until = 0
+        self.next_hi = time.time() + random.uniform(*HI_EVERY)
 
-        self.side_var = tk.StringVar(value=self.conf.get("side", "random"))
-        self.menu = tk.Menu(self.root, tearoff=0)
-        sides = tk.Menu(self.menu, tearoff=0)
-        for s in ("random",) + EDGES:
-            sides.add_radiobutton(label=s.title(), value=s, variable=self.side_var, command=self.set_side)
-        self.menu.add_cascade(label="Peek from", menu=sides)
-        self.menu.add_command(label="Mute", command=self.toggle_mute)
-        self.menu.add_command(label="Test wave", command=self.test)
-        self.menu.add_separator()
-        self.menu.add_command(label="Quit", command=self.quit)
-        self.refresh_menu()
+        self.vars = {name: (tk.BooleanVar if isinstance(DEFAULTS[name], bool) else tk.StringVar)(
+            value=self.conf[name]) for name in ("char", "side", "sound", "approve", "say_hi", "quiet_hours")}
 
-        self.c.bind("<Button-1>", lambda e: self.hide())
-        self.c.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+        r = self.root
+        r.bind("<Motion>", self.on_motion)
+        r.bind("<Leave>", lambda e: self.set_hover(None))
+        r.bind("<ButtonRelease-1>", self.on_click)
+        r.bind("<Button-3>", lambda e: self.popup_menu(e.x_root, e.y_root))
+        if sysutil.MAC:
+            r.bind("<Button-2>", lambda e: self.popup_menu(e.x_root, e.y_root))
+
+        self.tray = None
+        if sysutil.WIN:
+            try:
+                self.ensure_icon()
+                self.tray = Tray(ICON, "Claude Buddy")
+            except Exception:
+                self.tray = None
 
         with open(PID_FILE, "w") as f:
             f.write(str(os.getpid()))
-        self.place()
-        self.root.withdraw()
         self.poll()
-        self.animate()
+        self.tick()
 
-    # --- config ---
-    def load_conf(self):
-        try:
-            return json.load(open(CONF))
-        except (OSError, ValueError):
-            return {}
+    # --- settings ---
+    def set_conf(self, name, value):
+        self.conf[name] = value
+        save(CONF, self.conf)
 
-    def save_conf(self):
-        with open(CONF, "w") as f:
-            json.dump(self.conf, f)
+    def from_var(self, name):
+        self.set_conf(name, self.vars[name].get())
+        if name == "char":
+            self.test()
 
-    def set_side(self):
-        self.conf["side"] = self.side_var.get()
-        self.save_conf()
+    def ensure_icon(self):
+        if not os.path.exists(ICON):
+            os.makedirs(os.path.dirname(ICON), exist_ok=True)
+            render.icon("golden", 256).save(ICON, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64)])
 
-    def toggle_mute(self):
-        self.conf["muted"] = not self.conf.get("muted")
-        self.save_conf()
-        self.refresh_menu()
+    def quiet(self):
+        """Do-not-disturb, quiet hours, or a full-screen app / presentation."""
+        if time.time() < self.conf.get("dnd_until", 0):
+            return True
+        if self.conf.get("quiet_hours"):
+            h = time.localtime().tm_hour
+            if h >= QUIET[0] or h < QUIET[1]:
+                return True
+        return sysutil.presenting()
 
-    def refresh_menu(self):
-        self.menu.entryconfig(1, label="Unmute" if self.conf.get("muted") else "Mute")
+    def set_dnd(self, secs):
+        if secs == "8am":
+            now = time.localtime()
+            until = time.mktime((now.tm_year, now.tm_mon, now.tm_mday + (1 if now.tm_hour >= 8 else 0),
+                                 8, 0, 0, 0, 0, -1))
+        else:
+            until = time.time() + secs if secs else 0
+        self.set_conf("dnd_until", until)
+
+    # --- stats ---
+    def today(self):
+        d = time.strftime("%Y-%m-%d")
+        if self.stats.get("date") != d:
+            self.stats = {"date": d, "waited": 0, "pings": 0}
+        return self.stats
+
+    def stats_text(self):
+        s = self.today()
+        pings = s["pings"]
+        if not pings:
+            return "no pings yet today"
+        return f"claude waited {fmt_minutes(s['waited'])} on you · {pings} ping{'s' * (pings != 1)}"
+
+    # --- sessions ---
+    def poll(self):
+        now = time.time()
+        sessions = {}
+        for p in glob.glob(os.path.join(SESSIONS, "*.json")):
+            if p.endswith(".answer.json"):
+                continue
+            rec = load(p, None)
+            if rec and now - rec.get("updated", 0) < STALE:
+                sessions[os.path.basename(p)[:-5]] = rec
+        sessions.update(self.fake)
+        self.sessions = sessions
+
+        # alerts that got answered in the terminal count as handled, and add to "time waited"
+        for sid, rec in sessions.items():
+            before = self.prev_state.get(sid)
+            if before in ("ask", "done") and rec["state"] == "working":
+                at = rec.get("alert_at", 0)
+                if self.shown.get(sid) == at and self.handled.get(sid) != at:
+                    self.today()["waited"] += min(rec["updated"] - at, 3600)
+                    save(STATS, self.stats)
+                self.handled[sid] = at
+            self.prev_state[sid] = rec["state"]
+
+        quiet = self.quiet()
+        fresh = None
+        for sid, rec in sessions.items():
+            at = rec.get("alert_at", 0)
+            if rec["state"] == "working" or at <= max(self.shown.get(sid, 0), self.handled.get(sid, 0)):
+                continue
+            if at < self.started - STARTUP_GRACE:
+                self.handled[sid] = at  # old news from before the buddy started
+                continue
+            if sid != TEST and sysutil.is_focused(rec.get("pids") or [], rec.get("project", ""), rec.get("hwnd")):
+                self.handled[sid] = at  # they're already looking at it
+                continue
+            if quiet:
+                continue  # stays fresh; pops when the quiet time is over
+            self.shown[sid] = at
+            self.today()["pings"] += 1
+            save(STATS, self.stats)
+            if fresh is None or rec["state"] == "ask":
+                fresh = sid
+
+        self.update_pending()
+
+        if fresh:
+            self.current = fresh
+            self.pop("alert")
+            self.ping(sessions[fresh]["state"])
+        elif self.pending:
+            if self.current not in self.pending:
+                self.current = self.pending[0]
+                self.t0 = time.time() - 4  # little hop for the next one
+            if self.mode != "alert" and not quiet:
+                self.pop("alert")
+        elif self.mode == "alert":
+            self.hide()
+
+        # ignored for a while: doze off, then one more nudge
+        if self.mode == "alert" and self.current:
+            key = (self.current, sessions[self.current].get("alert_at"))
+            if now - self.alert_started > REMIND_AFTER and key not in self.reminded:
+                self.reminded.add(key)
+                self.t0 = self.alert_started = now
+                self.ping(sessions[self.current]["state"])
+
+        if (self.mode == "hidden" and self.conf.get("say_hi") and now > self.next_hi and not quiet
+                and any(now - r.get("updated", 0) < 1800 for r in sessions.values())):
+            self.next_hi = now + random.uniform(*HI_EVERY)
+            self.say_hi()
+
+        if self.tray:
+            n = len(self.pending)
+            head = f"{n} session{'s' * (n != 1)} waiting" if n else "Claude Buddy"
+            self.tray.set_tip(f"{head}\n{self.stats_text()}")
+            self.handle_tray()
+        self.root.after(400, self.poll)
+
+    def update_pending(self):
+        """Alerts we popped up for that nobody has dealt with yet, questions first."""
+        sessions = self.sessions
+        self.pending = sorted(
+            (sid for sid, rec in sessions.items()
+             if rec["state"] != "working" and self.shown.get(sid) == rec.get("alert_at")
+             and self.handled.get(sid) != rec.get("alert_at") and (sid != TEST or sid in self.fake)),
+            key=lambda s: (sessions[s]["state"] != "ask", sessions[s].get("alert_at", 0)))
+
+    def handle_tray(self):
+        while self.tray.events:
+            ev = self.tray.events.pop(0)
+            if ev == "left":
+                if self.pending:
+                    self.pop("alert")
+                else:
+                    self.say_hi()
+            else:
+                x, y = self.root.winfo_pointerxy()
+                self.popup_menu(x, y)
+
+    def ping(self, state):
+        sound = self.conf.get("sound", "voice")
+        if sound == "off":
+            return
+        if sound == "beep":
+            sysutil.play(None, state)
+            return
+        names = render.CHARACTERS.get(self.conf["char"], render.CHARACTERS["golden"])["sounds"]
+        sysutil.play(os.path.join(SOUNDS, (names[0] if state == "ask" else names[1]) + ".wav"), state)
+
+    # --- show / hide ---
+    def pop(self, mode):
+        was_hidden = self.progress == 0 and self.target == 0
+        self.mode = mode
+        if was_hidden:
+            side = self.conf.get("side", "random")
+            self.edge = random.choice(EDGES) if side == "random" else side
+            self.anchor = random.uniform(0.15, 0.85)
+            self.area = sysutil.work_area_at_cursor() or (0, 0, self.root.winfo_screenwidth(),
+                                                          self.root.winfo_screenheight())
+        self.target = 1.0
+        self.t0 = self.alert_started = time.time()
+
+    def hide(self):
+        self.target = 0.0
+        self.mode = "hidden"
+        self.hover = None
+
+    def say_hi(self):
+        self.pop("hi")
+        self.hi_until = time.time() + 4
 
     def test(self):
-        self.show({"state": "ask", "project": "test", "message": "hi! i need you :)"})
+        now = time.time()
+        self.fake[TEST] = {"state": "ask", "project": "test", "message": "Bash: npm test", "alert_at": now,
+                           "updated": now, "waiting": True, "suggest": True, "kind": "permission"}
+
+    def resolve(self, sid):
+        rec = self.sessions.get(sid, {})
+        self.handled[sid] = rec.get("alert_at")
+        self.fake.pop(sid, None)
+        self.update_pending()
+        if self.pending:
+            self.current = self.pending[0]
+            self.t0 = time.time() - 4
+        else:
+            self.hide()
+
+    # --- drawing ---
+    def tick(self):
+        if self.progress < self.target:
+            self.progress = min(self.target, self.progress + 0.08)
+        elif self.progress > self.target:
+            self.progress = max(self.target, self.progress - 0.08)
+        if self.mode == "hi" and time.time() > self.hi_until and self.hover is None:
+            self.hide()
+        if self.progress > 0:
+            try:
+                self.draw()
+            except KeyError:
+                self.hide()
+        else:
+            self.win.hide()
+        self.root.after(33 if self.progress > 0 or self.target > 0 else 250, self.tick)
+
+    def content(self):
+        """(record, title, subtitle, buttons, pager) for whatever we're showing."""
+        if self.mode == "hi" or self.current not in self.sessions:
+            rec, title, sub = {"state": "hi"}, "hi! just checking in", "you're doing great"
+            buttons, pager = (), None
+        else:
+            rec = self.sessions[self.current]
+            proj = rec.get("project", "claude")
+            n = len(self.pending)
+            pager = f"{self.pending.index(self.current) + 1}/{n}" if n > 1 and self.current in self.pending else None
+            buttons = ()
+            if rec["state"] == "ask":
+                title = f"{VOICE.get(self.conf['char'], 'woof!')} i need you"
+                sub = f"{proj} · {rec.get('message', '')}"
+                if rec.get("waiting") and self.conf.get("approve"):
+                    buttons = ("allow", "always", "deny") if rec.get("suggest") else ("allow", "deny")
+            else:
+                if rec.get("party"):
+                    title = "tests passed!"
+                elif rec.get("celebrate"):
+                    title = f"done after {fmt_minutes(rec.get('took', 0))}!"
+                else:
+                    title = "all done!"
+                sub = f"{proj} · your turn"
+        if self.hover == "creature":
+            title, sub, buttons, pager = "today so far", self.stats_text(), (), None
+        if len(sub) > 48:
+            sub = sub[:47] + "…"
+        return rec, title, sub, buttons, pager
+
+    def draw(self):
+        rec, title, sub, buttons, pager = self.content()
+        now = time.time()
+        t = now - self.t0
+        state = rec["state"]
+        sleepy = self.mode == "alert" and now - self.alert_started > SLEEPY_AFTER
+        crit = render.creature(self.conf["char"], state, t, self.k, sleepy=sleepy,
+                               party=bool(rec.get("party")) and state == "done",
+                               celebrate=bool(rec.get("celebrate")) and state == "done")
+        accent = render.ACCENT["stats" if self.hover == "creature" else state]
+        hover = self.hover if self.hover in buttons else None
+        bub, hits = render.bubble(title, sub, accent, render.TAIL[self.edge], self.k, buttons, pager, hover)
+        img, boxes = render.compose(self.edge, crit, bub, hits, self.k)
+
+        # place against the edge, sliding in; crop whatever would spill past the work area
+        l, t_, r, b = self.area
+        w, h = img.size
+        e = 1 - (1 - self.progress) ** 3
+        if self.edge in ("bottom", "top"):
+            x = int(min(max(l + (r - l) * self.anchor - w / 2, l), r - w))
+            y = int(b - h * e) if self.edge == "bottom" else int(t_ - h + h * e)
+        else:
+            y = int(min(max(t_ + (b - t_) * self.anchor - h / 2, t_), b - h))
+            x = int(r - w * e) if self.edge == "right" else int(l - w + w * e)
+        x1, y1, x2, y2 = max(x, l), max(y, t_), min(x + w, r), min(y + h, b)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            self.win.hide()
+            return
+        self.crop = (x1 - x, y1 - y)
+        self.boxes = boxes
+        self.win.update(img.crop((x1 - x, y1 - y, x2 - x, y2 - y)), x1, y1)
+
+    # --- mouse ---
+    def hit(self, e):
+        x, y = e.x + self.crop[0], e.y + self.crop[1]
+        for name in ("allow", "always", "deny", "prev", "next", "bubble", "creature"):
+            box = self.boxes.get(name)
+            if box and box[0] <= x <= box[2] and box[1] <= y <= box[3]:
+                return name
+        return None
+
+    def set_hover(self, name):
+        self.hover = name
+
+    def on_motion(self, e):
+        self.set_hover(self.hit(e))
+
+    def on_click(self, e):
+        name = self.hit(e)
+        if self.mode != "alert" or self.current not in self.sessions:
+            self.hide()
+            return
+        sid, rec = self.current, self.sessions[self.current]
+        if name in ("allow", "always", "deny"):
+            if sid != TEST:
+                save(os.path.join(SESSIONS, f"{sid}.answer.json"), {"req": rec.get("req"), "behavior": name})
+            self.resolve(sid)
+        elif name in ("prev", "next") and len(self.pending) > 1:
+            i = self.pending.index(sid) if sid in self.pending else 0
+            self.current = self.pending[(i + (1 if name == "next" else -1)) % len(self.pending)]
+            self.t0 = time.time() - 4
+        elif name in ("bubble", "creature"):
+            if sid != TEST:
+                sysutil.focus(rec.get("pids") or [], rec.get("project", ""), rec.get("hwnd"))
+            self.resolve(sid)
+
+    # --- menu ---
+    def popup_menu(self, x, y):
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label=self.stats_text(), state="disabled")
+        if self.pending:
+            m.add_command(label=f"Show waiting sessions ({len(self.pending)})", command=lambda: self.pop("alert"))
+        m.add_separator()
+
+        def radio_menu(name, options):
+            sub = tk.Menu(m, tearoff=0)
+            for value, label in options:
+                sub.add_radiobutton(label=label, value=value, variable=self.vars[name],
+                                    command=lambda n=name: self.from_var(n))
+            return sub
+
+        m.add_cascade(label="Character", menu=radio_menu("char", [(k, c["name"]) for k, c in
+                                                                  render.CHARACTERS.items()]))
+        m.add_cascade(label="Peek from", menu=radio_menu("side", [(s, s.title()) for s in ("random",) + EDGES]))
+        m.add_cascade(label="Sound", menu=radio_menu("sound", [("voice", "Character voice"), ("beep", "System beep"),
+                                                               ("off", "Off")]))
+        m.add_checkbutton(label="Allow / Deny from the bubble", variable=self.vars["approve"],
+                          command=lambda: self.from_var("approve"))
+        m.add_checkbutton(label="Say hi now and then", variable=self.vars["say_hi"],
+                          command=lambda: self.from_var("say_hi"))
+        m.add_separator()
+        dnd = tk.Menu(m, tearoff=0)
+        dnd.add_command(label="For 1 hour", command=lambda: self.set_dnd(3600))
+        dnd.add_command(label="Until 8am", command=lambda: self.set_dnd("8am"))
+        dnd.add_command(label="Off", command=lambda: self.set_dnd(0))
+        on = time.time() < self.conf.get("dnd_until", 0)
+        m.add_cascade(label="Do not disturb" + (" (on)" if on else ""), menu=dnd)
+        m.add_checkbutton(label="Quiet hours (10pm–8am)", variable=self.vars["quiet_hours"],
+                          command=lambda: self.from_var("quiet_hours"))
+        m.add_separator()
+        m.add_command(label="Test wave", command=self.test)
+        m.add_command(label="Quit", command=self.quit)
+        self.win.grab_focus()
+        m.tk_popup(x, y)
 
     def quit(self):
+        if self.tray:
+            self.tray.remove()
         try:
             os.remove(PID_FILE)
         except OSError:
             pass
         self.root.destroy()
 
-    # --- layout per edge: canvas size, puppy rotation, bubble spot ---
-    def layout(self, edge):
-        self.edge = edge
-        if edge == "bottom":
-            self.cw, self.ch = BUBW, BUBH + DOGH
-            ox = (BUBW - DOGW) / 2
-            fn, dang = (lambda x, y: (ox + x - DX0, BUBH + y - DY0)), 0
-            self.bubble = (BUBW / 2, BUBH / 2 - 2, "down")
-        elif edge == "top":  # hanging upside-down
-            self.cw, self.ch = BUBW, BUBH + DOGH
-            ox = (BUBW - DOGW) / 2
-            fn, dang = (lambda x, y: (ox + DOGW - (x - DX0), DOGH - (y - DY0))), 180
-            self.bubble = (BUBW / 2, DOGH + BUBH / 2 + 2, "up")
-        elif edge == "right":
-            self.cw, self.ch = BUBW + DOGH, DOGW
-            fn, dang = (lambda x, y: (BUBW + y - DY0, DOGW - (x - DX0))), 90
-            self.bubble = (BUBW / 2, DOGW / 2, "right")
-        else:  # left
-            self.cw, self.ch = DOGH + BUBW, DOGW
-            fn, dang = (lambda x, y: (DOGH - (y - DY0), x - DX0)), -90
-            self.bubble = (DOGH + BUBW / 2, DOGW / 2, "left")
-        self.pen = Pen(self.c, fn, dang)
-        self.c.config(width=self.cw, height=self.ch)
 
-    # --- show / hide ---
-    def show(self, rec):
-        was_hidden = self.progress == 0 and self.target == 0
-        self.alert = rec
-        if was_hidden:
-            side = self.conf.get("side", "random")
-            self.layout(random.choice(EDGES) if side == "random" else side)
-            self.offset = random.uniform(0.15, 0.85)
-        self.target = 1.0
-        self.t0 = time.time()
-        self.root.deiconify()
-        self.root.attributes("-topmost", True)
-        if not self.conf.get("muted"):
-            winsound.MessageBeep(winsound.MB_ICONHAND if rec["state"] == "ask" else winsound.MB_ICONASTERISK)
+def running_pid():
+    try:
+        pid = int(open(PID_FILE).read().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid != os.getpid() and sysutil.pid_alive(pid) else None
 
-    def hide(self):
-        self.target = 0.0
 
-    def place(self):
-        l, t, r, b = work_area()
-        p = 1 - (1 - self.progress) ** 3  # ease-out
-        w, h = self.cw, self.ch
-        if self.edge in ("bottom", "top"):
-            x = int(l + (r - l - w) * self.offset)
-            y = int(b - h * p) if self.edge == "bottom" else int(t - h + h * p)
-        else:
-            y = int(t + (b - t - h) * self.offset)
-            x = int(l - w + w * p) if self.edge == "left" else int(r - w * p)
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
-
-    # --- session polling ---
-    def poll(self):
-        now = time.time()
-        sessions = {}
-        for p in glob.glob(os.path.join(SESSIONS, "*.json")):
-            try:
-                rec = json.load(open(p))
-            except (OSError, ValueError):
-                continue
-            if now - rec.get("updated", 0) < STALE:
-                sessions[os.path.basename(p)] = rec
-
-        fresh = None
-        for sid, rec in sessions.items():
-            if rec["state"] != "working" and rec.get("alert_at", 0) > self.seen.get(sid, 0):
-                self.seen[sid] = rec["alert_at"]
-                if fresh is None or rec["state"] == "ask":
-                    fresh = rec
-        if fresh:
-            self.show(fresh)
-        elif self.target and self.alert and self.alert.get("project") != "test":
-            # Duck back by itself once nothing is waiting on you anymore.
-            if not any(r["state"] != "working" for r in sessions.values()):
-                self.hide()
-
-        self.root.after(400, self.poll)
-
-    # --- drawing ---
-    def animate(self):
-        step = 0.07
-        if self.progress < self.target:
-            self.progress = min(self.target, self.progress + step)
-        elif self.progress > self.target:
-            self.progress = max(self.target, self.progress - step)
-            if self.progress == 0:
-                self.root.withdraw()
-        if self.progress > 0:
-            self.place()
-            self.c.delete("all")
-            rec = self.alert or {"state": "done", "project": "", "message": ""}
-            self.draw_puppy(rec)
-            self.draw_bubble(rec)
-        self.root.after(16, self.animate)
-
-    def draw_puppy(self, rec):
-        pen = self.pen
-        asking = rec["state"] == "ask"
-        accent = COLORS.get(rec["state"], COLORS["done"])
-        t = time.time() - self.t0
-        excited = t < 6  # wave hard at first, then calm down
-        speed = 10 if excited else 4
-
-        bounce = abs(math.sin(t * 5)) if excited else abs(math.sin(t * 1.5)) * 0.25
-        stretch = 0.06 * (bounce - 0.5)
-        cx = 125
-        base = 178 - bounce * 10
-        hy = base - 52
-        hrx, hry = 38 * (1 - stretch), 31 * (1 + stretch)
-
-        # floating hearts / sparkles
-        for i in range(3):
-            ph = (t * 0.5 + i / 3) % 1
-            px = cx + (i - 1) * 32 + math.sin(ph * 6 + i) * 8
-            py = hy - hry - 4 - ph * 40
-            size = -int(12 + 6 * math.sin(ph * math.pi))
-            glyph = "✦" if asking and i != 1 else "♥"
-            pen.text(px, py, text=glyph, fill=accent, font=("Segoe UI Symbol", size))
-
-        # body + collar (mostly past the screen edge; peeks out on the hop)
-        pen.oval(cx - 28, base - 38, cx + 28, base, fill=DOG, outline=DOG_EDGE, width=3)
-        pen.line(cx - 22, base - 33, cx, base - 29, cx + 22, base - 33, smooth=True, fill=accent, width=6, capstyle="round")
-        pen.oval(cx - 5, base - 30, cx + 5, base - 20, fill="#ffd166", outline="#d9a520", width=2)
-
-        # head, eye patch, floppy ears that flap with the hop
-        pen.oval(cx - hrx, hy - hry, cx + hrx, hy + hry, fill=DOG, outline=DOG_EDGE, width=3)
-        pen.oval(cx + 4, hy - 20, cx + 28, hy + 4, fill=PATCH, outline="")
-        flap = (1 - bounce) * 6
-        for s in (-1, 1):
-            pen.polygon(cx + s * 22, hy - hry + 2,
-                        cx + s * (hrx + 10), hy - hry + 10,
-                        cx + s * (hrx + 10), hy + 12 + flap,
-                        cx + s * (hrx - 2), hy + 16 + flap,
-                        cx + s * (hrx - 8), hy - 6,
-                        smooth=True, fill=EAR, outline=EAR_EDGE, width=2)
-        # muzzle + nose
-        pen.oval(cx - 15, hy + 1, cx + 15, hy + 23, fill=MUZZLE, outline="")
-        pen.oval(cx - 6, hy + 1, cx + 6, hy + 9, fill=INK, outline="")
-        pen.oval(cx - 3, hy + 2, cx, hy + 4, fill="white", outline="")
-
-        # eyes: big and shiny, happy ^ ^ squint now and then
-        eye_y = hy - 7
-        happy = not asking and (t % 4) > 3.2
-        blink = (t % 3.3) < 0.1
-        for s in (-1, 1):
-            ex_ = cx + s * 15
-            if happy:
-                pen.arc(ex_ - 7, eye_y - 4, ex_ + 7, eye_y + 8, start=20, extent=140, style="arc", outline=INK, width=3)
-            elif blink:
-                pen.arc(ex_ - 7, eye_y - 8, ex_ + 7, eye_y + 4, start=200, extent=140, style="arc", outline=INK, width=3)
-            else:
-                h = 10 if asking else 9
-                pen.oval(ex_ - 7, eye_y - h, ex_ + 7, eye_y + h, fill=INK, outline="")
-                pen.oval(ex_ - 3, eye_y - h + 3, ex_ + 2, eye_y - h + 8, fill="white", outline="")
-                pen.oval(ex_ + 3, eye_y + 2, ex_ + 5, eye_y + 4, fill="white", outline="")
-        for s in (-1, 1):
-            pen.oval(cx + s * 26 - 6, hy + 7, cx + s * 26 + 6, hy + 12, fill=BLUSH, outline="")
-
-        # waving arm + paw with toe beans
-        sx, sy = cx + 46, base - 22
-        ang = math.radians(-85 + 30 * math.sin(t * speed))
-        ex, ey = sx + 40 * math.cos(ang), sy + 40 * math.sin(ang)
-        pen.line(sx, sy, ex, ey, fill=DOG_EDGE, width=14, capstyle="round")
-        pen.line(sx, sy, ex, ey, fill=DOG, width=9, capstyle="round")
-        pen.oval(ex - 10, ey - 10, ex + 10, ey + 10, fill=DOG, outline=DOG_EDGE, width=3)
-        pen.oval(ex - 4, ey - 1, ex + 4, ey + 5, fill=BLUSH, outline="")
-        for bx, by in ((-6, -5), (0, -7), (6, -5)):
-            pen.oval(ex + bx - 2, ey + by - 2, ex + bx + 2, ey + by + 2, fill=BLUSH, outline="")
-
-        # mouth: happy "w" with tongue out, or a worried little "o" + sweat drop
-        my = hy + 12
-        if asking:
-            o = 2.5 + 1.5 * abs(math.sin(t * 6))
-            pen.oval(cx - o, my + 2 - o, cx + o, my + 2 + o, fill=INK, outline="")
-            dx, dy = cx - 36, hy - 24 + 3 * math.sin(t * 3)
-            pen.polygon(dx, dy - 8, dx - 5, dy + 2, dx, dy + 6, dx + 5, dy + 2, smooth=True, fill="#9ad4f5", outline="#5aa9d6")
-        else:
-            bob = 2 * math.sin(t * 8)
-            pen.oval(cx - 5, my + 1, cx + 5, my + 12 + bob, fill=TONGUE, outline="#e05a7a", width=1)
-            pen.arc(cx - 8, my - 5, cx, my + 3, start=180, extent=180, style="arc", outline=INK, width=2)
-            pen.arc(cx, my - 5, cx + 8, my + 3, start=180, extent=180, style="arc", outline=INK, width=2)
-
-    def draw_bubble(self, rec):
-        c = self.c
-        asking = rec["state"] == "ask"
-        accent = COLORS.get(rec["state"], COLORS["done"])
-        title = "woof! i need you ♡" if asking else "all done! ♡"
-        msg = rec.get("message", "")
-        msg = msg if len(msg) <= 32 else msg[:31] + "…"
-        bx, by, tail = self.bubble
-        txt = c.create_text(bx, by, text=f"{title}\n{rec.get('project', '')} · {msg}",
-                            fill=INK, font=FONT, justify="center")
-        x1, y1, x2, y2 = c.bbox(txt)
-        x1, y1, x2, y2 = x1 - 11, y1 - 6, x2 + 11, y2 + 6
-        r = 13
-        c.create_polygon(x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
-                         x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
-                         smooth=True, fill="#fffaf3", outline=accent, width=2)
-        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-        if tail == "down":
-            tri, seam = (mx - 7, y2, mx + 7, y2, mx, y2 + 9), (mx - 6, y2, mx + 6, y2)
-        elif tail == "up":
-            tri, seam = (mx - 7, y1, mx + 7, y1, mx, y1 - 9), (mx - 6, y1, mx + 6, y1)
-        elif tail == "right":
-            tri, seam = (x2, my - 7, x2, my + 7, x2 + 9, my), (x2, my - 6, x2, my + 6)
-        else:
-            tri, seam = (x1, my - 7, x1, my + 7, x1 - 9, my), (x1, my - 6, x1, my + 6)
-        c.create_polygon(*tri, fill="#fffaf3", outline=accent, width=2)
-        c.create_line(*seam, fill="#fffaf3", width=3)
-        c.tag_raise(txt)
+def main():
+    os.makedirs(SESSIONS, exist_ok=True)
+    pid = running_pid()
+    if "--quit" in sys.argv:
+        if pid:
+            sysutil.kill(pid)
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+        return
+    if pid:
+        return  # already running
+    if sysutil.WIN:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
+    Buddy().root.mainloop()
 
 
 if __name__ == "__main__":
-    os.makedirs(SESSIONS, exist_ok=True)
-    Buddy().root.mainloop()
+    main()

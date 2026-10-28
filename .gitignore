@@ -1,5 +1,7 @@
 sessions/
 widget.pid
 buddy_conf.json
+stats.json
+assets/
 __pycache__/
 *.tmp
