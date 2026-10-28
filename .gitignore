@@ -1,0 +1,5 @@
+sessions/
+widget.pid
+buddy_conf.json
+__pycache__/
+*.tmp
