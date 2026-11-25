@@ -21,7 +21,8 @@ of the way while Claude works.
 - **Click the buddy to jump to that session.** It brings the right Windows
   Terminal or VS Code window to the front.
 - **Several sessions at once:** a `1/3 ‹ ›` pager in the bubble, questions first.
-- **Doesn't ping you when you're already looking** at that session's window.
+- **Doesn't ping you when you're already looking** at that session's window, and
+  **ducks away once you get there yourself** (alt-tab, taskbar, whatever), no click needed.
 - **Falls asleep if ignored** (zzz), then nudges you once more after 5 minutes.
 - **Hover for today's stats:** how long Claude waited on you, and how many pings.
 - **Tray icon** for when it's hidden: hover for the waiting count, left-click to
@@ -79,6 +80,9 @@ Claude Code ──hook events──▶ buddy_hook.py ──▶ sessions/<id>.jso
   looking at that session. It waits up to `approve_wait` seconds, and stops as
   soon as you switch to the window, so the normal prompt is never held up while
   you're right there.
+- While an alert is showing, `buddy.pyw` keeps checking the foreground window. Once
+  you've been on that session's window for about a second (`SEEN_AFTER`), the alert
+  counts as seen and the buddy ducks away, however you got there.
 - `buddy.pyw` is a click-through, per-pixel-alpha window drawn with Pillow
   (`render.py`). `sysutil.py` handles windows, focus, sound and Do Not Disturb.
 - The art and the sounds are generated in code (`render.py`, `tools/make_sounds.py`).

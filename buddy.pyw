@@ -41,6 +41,7 @@ EDGES = ("bottom", "left", "right", "top")
 STALE = 6 * 3600
 SLEEPY_AFTER, REMIND_AFTER = 120, 300
 STARTUP_GRACE = 600  # alerts older than this when the buddy starts are skipped
+SEEN_AFTER = 1.0  # seconds on a session's window before its alert counts as seen (so alt-tab skimming doesn't)
 HI_EVERY = (25 * 60, 45 * 60)
 QUIET = (22, 8)  # quiet hours: 10pm to 8am
 TEST = "__test__"
@@ -287,6 +288,7 @@ class Buddy:
         self.shown = {}          # sid -> alert_at we already popped up for
         self.handled = {}        # sid -> alert_at the user dealt with
         self.reminded = set()
+        self.looking_since = {}  # sid -> when the user started looking at its window (pending alerts only)
         self.pending = []
         self.current = None
         self.mode = "hidden"     # hidden | alert | hi
@@ -415,6 +417,21 @@ class Buddy:
                 fresh = sid
 
         self.update_pending()
+
+        # went to the session's window on their own (not via the buddy): that counts as seeing it
+        for sid in list(self.pending):
+            rec = sessions[sid]
+            if sid == TEST or not sysutil.is_focused(rec.get("pids") or [], rec.get("project", ""), rec.get("hwnd")):
+                self.looking_since.pop(sid, None)
+                continue
+            since = self.looking_since.setdefault(sid, now)
+            if now - since >= SEEN_AFTER:
+                self.looking_since.pop(sid, None)
+                at = rec.get("alert_at", 0)
+                self.today()["waited"] += min(max(since - at, 0), 3600)
+                save(STATS, self.stats)
+                self.resolve(sid)
+        self.looking_since = {s: t for s, t in self.looking_since.items() if s in self.pending}
 
         if fresh:
             self.current = fresh
